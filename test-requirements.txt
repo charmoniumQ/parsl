@@ -14,6 +14,10 @@ types-python-dateutil
 types-requests
 types-six
 sqlalchemy-stubs
+typing_extensions   # to get newer type checking features - specifically PEP 589 on python <3.8
+types-paramiko
+types-requests
+types-six
 Sphinx==4.5.0
 twine
 wheel

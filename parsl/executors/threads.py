@@ -2,7 +2,7 @@ import logging
 import typeguard
 import concurrent.futures as cf
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from parsl.data_provider.staging import Staging
 from parsl.executors.status_handling import NoStatusHandlingExecutor
@@ -27,8 +27,8 @@ class ThreadPoolExecutor(NoStatusHandlingExecutor, RepresentationMixin):
     """
 
     @typeguard.typechecked
-    def __init__(self, label: str = 'threads', max_threads: int = 2,
-                 thread_name_prefix: str = '', storage_access: Optional[List[Staging]] = None,
+    def __init__(self, label: str = 'threads', max_threads: int = 3,
+                 thread_name_prefix: str = '', storage_access: Optional[Sequence[Staging]] = None,
                  working_dir: Optional[str] = None):
         NoStatusHandlingExecutor.__init__(self)
         self.label = label
@@ -60,7 +60,7 @@ class ThreadPoolExecutor(NoStatusHandlingExecutor, RepresentationMixin):
 
         return self.executor.submit(func, *args, **kwargs)
 
-    def scale_out(self, workers=1):
+    def scale_out(self, workers: int = 1) -> List[str]:
         """Scales out the number of active workers by 1.
 
         This method is notImplemented for threads and will raise the error if called.
@@ -71,7 +71,7 @@ class ThreadPoolExecutor(NoStatusHandlingExecutor, RepresentationMixin):
 
         raise NotImplementedError
 
-    def scale_in(self, blocks):
+    def scale_in(self, blocks) -> List[str]:
         """Scale in the number of active blocks by specified amount.
 
         This method is not implemented for threads and will raise the error if called.
@@ -95,9 +95,9 @@ class ThreadPoolExecutor(NoStatusHandlingExecutor, RepresentationMixin):
 
         """
         logger.debug("Shutting down executor, which involves waiting for running tasks to complete")
-        x = self.executor.shutdown(wait=block)
+        self.executor.shutdown(wait=block)
         logger.debug("Done with executor shutdown")
-        return x
+        return True
 
     def monitor_resources(self):
         """Resource monitoring sometimes deadlocks when using threads, so this function

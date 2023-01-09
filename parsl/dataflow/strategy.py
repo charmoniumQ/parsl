@@ -1,17 +1,45 @@
+from __future__ import annotations
 import logging
 import time
 import math
 import warnings
 from typing import List
 
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from parsl.dataflow.dflow import DataFlowKernel
+    from parsl.dataflow.job_status_poller import PollItem
+
+from parsl.executors.base import ParslExecutor, HasConnectedWorkers, HasOutstanding
+
+from typing import Dict
+from typing import Callable
+from typing import Optional
+from typing import Sequence
+from typing_extensions import TypedDict
+
+# this is used for testing a class to decide how to
+# print a status line. That might be better done inside
+# the executor class (i..e put the class specific behaviour
+# inside the class, rather than testing class instance-ness
+# here)
+
+# smells: testing class instance; importing a specific instance
+# of a thing that should be generic
+
+
 from parsl.dataflow.executor_status import ExecutorStatus
 from parsl.executors import HighThroughputExecutor
 from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.providers.provider_base import JobState
-from parsl.process_loggers import wrap_with_logs
+# from parsl.process_loggers import wrap_with_logs
 
 
 logger = logging.getLogger(__name__)
+
+
+class ExecutorIdleness(TypedDict):
+    idle_since: Optional[float]
 
 
 class Strategy(object):
@@ -110,32 +138,43 @@ class Strategy(object):
 
     """
 
-    def __init__(self, dfk):
+    def __init__(self, dfk: "DataFlowKernel") -> None:
         """Initialize strategy."""
         self.dfk = dfk
         self.config = dfk.config
+
+        self.executors: Dict[str, ExecutorIdleness]
         self.executors = {}
+
         self.max_idletime = self.dfk.config.max_idletime
 
         for e in self.dfk.config.executors:
-            self.executors[e.label] = {'idle_since': None, 'config': e.label}
+            self.executors[e.label] = {'idle_since': None}
 
+        self.strategies: Dict[Optional[str], Callable]
         self.strategies = {None: self._strategy_noop,
                            'none': self._strategy_noop,
                            'simple': self._strategy_simple,
-                           'htex_auto_scale': self._strategy_htex_auto_scale}
+                           'htex_auto_scale': self._strategy_htex_auto_scale
+                          }
 
         if self.config.strategy is None:
             warnings.warn("literal None for strategy choice is deprecated. Use string 'none' instead.",
                           DeprecationWarning)
 
+        # mypy note: with mypy 0.761, the type of self.strategize is
+        # correctly revealed inside this module, but isn't carried over
+        #  when Strategy is used in other modules unless this specific
+        # type annotation is used.
+
+        self.strategize: Callable
         self.strategize = self.strategies[self.config.strategy]
 
         logger.debug("Scaling strategy: {0}".format(self.config.strategy))
 
-    def add_executors(self, executors):
+    def add_executors(self, executors: Sequence[ParslExecutor]) -> None:
         for executor in executors:
-            self.executors[executor.label] = {'idle_since': None, 'config': executor.label}
+            self.executors[executor.label] = {'idle_since': None}
 
     def _strategy_noop(self, status: List[ExecutorStatus], tasks: List[int]) -> None:
         """Do nothing.
@@ -145,10 +184,10 @@ class Strategy(object):
         """
         logger.debug("strategy_noop: doing nothing")
 
-    def _strategy_simple(self, status_list, tasks: List[int]) -> None:
+    def _strategy_simple(self, status_list: "List[PollItem]", tasks: List[int]) -> None:
         self._general_strategy(status_list, tasks, strategy_type='simple')
 
-    def _strategy_htex_auto_scale(self, status_list, tasks: List[int]) -> None:
+    def _strategy_htex_auto_scale(self, status_list: "List[PollItem]", tasks: List[int]) -> None:
         """HTEX specific auto scaling strategy
 
         This strategy works only for HTEX. This strategy will scale out by
@@ -168,8 +207,10 @@ class Strategy(object):
         """
         self._general_strategy(status_list, tasks, strategy_type='htex')
 
-    @wrap_with_logs
-    def _general_strategy(self, status_list, tasks, *, strategy_type):
+    # can't do wrap with logs until I learn about paramspecs, because wrap_with_logs
+    # is not tightly typed enough to be allowed in this module yet.
+    # @wrap_with_logs
+    def _general_strategy(self, status_list: "List[PollItem]", tasks: List[int], strategy_type: str) -> None:
         logger.debug(f"general strategy starting with strategy_type {strategy_type} for {len(status_list)} executors")
 
         for exec_status in status_list:
@@ -181,15 +222,21 @@ class Strategy(object):
             logger.debug(f"Strategizing for executor {label}")
 
             # Tasks that are either pending completion
+            assert isinstance(executor, HasOutstanding)
             active_tasks = executor.outstanding
 
             status = exec_status.status
+
+            # The provider might not even be defined -- what's the behaviour in
+            # that case?
+            if executor.provider is None:
+                logger.error("Trying to strategize an executor that has no provider")
+                continue
 
             # FIXME we need to handle case where provider does not define these
             # FIXME probably more of this logic should be moved to the provider
             min_blocks = executor.provider.min_blocks
             max_blocks = executor.provider.max_blocks
-            tasks_per_node = executor.workers_per_node
 
             nodes_per_block = executor.provider.nodes_per_block
             parallelism = executor.provider.parallelism
@@ -197,11 +244,17 @@ class Strategy(object):
             running = sum([1 for x in status.values() if x.state == JobState.RUNNING])
             pending = sum([1 for x in status.values() if x.state == JobState.PENDING])
             active_blocks = running + pending
-            active_slots = active_blocks * tasks_per_node * nodes_per_block
 
-            logger.debug(f"Slot ratio calculation: active_slots = {active_slots}, active_tasks = {active_tasks}")
+            # TODO: if this isinstance doesn't fire, tasks_per_node and active_slots won't be
+            # set this iteration and either will be unset or will contain a previous executor's value.
+            # in both cases, this is wrong. but apparently mypy doesn't notice.
 
-            if hasattr(executor, 'connected_workers'):
+            if isinstance(executor, HasConnectedWorkers):
+                tasks_per_node = executor.workers_per_node
+
+                active_slots = active_blocks * tasks_per_node * nodes_per_block
+                logger.debug(f"Slot ratio calculation: active_slots = {active_slots}, active_tasks = {active_tasks}")
+
                 logger.debug('Executor {} has {} active tasks, {}/{} running/pending blocks, and {} connected workers'.format(
                     label, active_tasks, running, pending, executor.connected_workers))
             else:
@@ -233,9 +286,18 @@ class Strategy(object):
                         logger.debug(f"Starting idle timer for executor. If idle time exceeds {self.max_idletime}s, blocks will be scaled in")
                         self.executors[executor.label]['idle_since'] = time.time()
 
+                    # ... this could be None, type-wise. So why aren't we seeing errors here?
+                    # probably becaues usually if this is None, it will be because active_tasks>0,
+                    # (although I can't see a clear proof that this will always be the case:
+                    # could that setting to None have happened on a previous iteration?)
+
+                    # if idle_since is None, then that means not idle, which means should not
+                    # go down the scale_in path
                     idle_since = self.executors[executor.label]['idle_since']
-                    idle_duration = time.time() - idle_since
-                    if idle_duration > self.max_idletime:
+                    if idle_since is not None and (time.time() - idle_since) > self.max_idletime:
+                        # restored this separate calculation even though making a single one
+                        # ahead of time is better...
+                        idle_duration = time.time() - idle_since
                         # We have resources idle for the max duration,
                         # we have to scale_in now.
                         logger.debug(f"Idle time has reached {self.max_idletime}s for executor {label}; scaling in")

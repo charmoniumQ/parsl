@@ -9,10 +9,10 @@ We have two basic types of futures:
 from concurrent.futures import Future
 import logging
 import threading
-from typing import Optional, Sequence
+from typing import Sequence, Optional
 
-from parsl.app.futures import DataFuture
 from parsl.dataflow.taskrecord import TaskRecord
+from parsl.app.futures import DataFuture
 
 logger = logging.getLogger(__name__)
 

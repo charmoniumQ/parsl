@@ -79,7 +79,6 @@ Executors
     parsl.executors.ExtremeScaleExecutor
     parsl.executors.LowLatencyExecutor
     parsl.executors.FluxExecutor
-    parsl.executors.swift_t.TurbineExecutor
 
 Launchers
 =========

@@ -7,7 +7,8 @@ import threading
 import time
 import typeguard
 from contextlib import contextmanager
-from typing import List, Tuple, Union, Generator, IO, AnyStr, Dict
+from typing import Any, Callable, List, Sequence, Tuple, Union, Generator, IO, AnyStr, Dict
+from typing_extensions import Protocol, runtime_checkable
 
 import parsl
 from parsl.version import VERSION
@@ -44,7 +45,7 @@ def get_version() -> str:
 
 
 @typeguard.typechecked
-def get_all_checkpoints(rundir: str = "runinfo") -> List[str]:
+def get_all_checkpoints(rundir: str = "runinfo") -> Sequence[str]:
     """Finds the checkpoints from all runs in the rundir.
 
     Kwargs:
@@ -73,7 +74,7 @@ def get_all_checkpoints(rundir: str = "runinfo") -> List[str]:
 
 
 @typeguard.typechecked
-def get_last_checkpoint(rundir: str = "runinfo") -> List[str]:
+def get_last_checkpoint(rundir: str = "runinfo") -> Sequence[str]:
     """Finds the checkpoint from the last run, if one exists.
 
     Note that checkpoints are incremental, and this helper will not find
@@ -105,11 +106,10 @@ def get_last_checkpoint(rundir: str = "runinfo") -> List[str]:
     return [last_checkpoint]
 
 
+@typeguard.typechecked
 def get_std_fname_mode(fdname: str, stdfspec: Union[str, Tuple[str, str]]) -> Tuple[str, str]:
     import parsl.app.errors as pe
-    if stdfspec is None:
-        return None, None
-    elif isinstance(stdfspec, str):
+    if isinstance(stdfspec, str):
         fname = stdfspec
         mode = 'a+'
     elif isinstance(stdfspec, tuple):
@@ -118,13 +118,6 @@ def get_std_fname_mode(fdname: str, stdfspec: Union[str, Tuple[str, str]]) -> Tu
                    f"{len(stdfspec)}")
             raise pe.BadStdStreamFile(msg, TypeError('Bad Tuple Length'))
         fname, mode = stdfspec
-        if not isinstance(fname, str) or not isinstance(mode, str):
-            msg = (f"std descriptor {fdname} has unexpected type "
-                   f"{type(stdfspec)}")
-            raise pe.BadStdStreamFile(msg, TypeError('Bad Tuple Type'))
-    else:
-        msg = f"std descriptor {fdname} has unexpected type {type(stdfspec)}"
-        raise pe.BadStdStreamFile(msg, TypeError('Bad Tuple Type'))
     return fname, mode
 
 
@@ -167,6 +160,11 @@ def wtime_to_minutes(time_string: str) -> int:
     return total_mins
 
 
+@runtime_checkable
+class IsWrapper(Protocol):
+    __wrapped__: Callable
+
+
 class RepresentationMixin(object):
     """A mixin class for adding a __repr__ method.
 
@@ -193,8 +191,11 @@ class RepresentationMixin(object):
     """
     __max_width__ = 80
 
+    # vs PR 1846: this has a type: ignore where I have more invasively changed the code to
+    # use type(self).__init__ and not checked if that works
     def __repr__(self) -> str:
-        init = self.__init__  # type: ignore
+        init: Any  # to override something I don't understand with myppy vs the init, iswrapper test below
+        init = type(self).__init__  # does this change from self.__init__ work?
 
         # This test looks for a single layer of wrapping performed by
         # functools.update_wrapper, commonly used in decorators. This will
@@ -204,7 +205,7 @@ class RepresentationMixin(object):
         # decorators, or cope with other decorators which do not use
         # functools.update_wrapper.
 
-        if hasattr(init, '__wrapped__'):
+        if isinstance(init, IsWrapper):
             init = init.__wrapped__
 
         argspec = inspect.getfullargspec(init)

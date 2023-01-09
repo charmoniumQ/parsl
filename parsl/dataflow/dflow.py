@@ -13,11 +13,16 @@ import sys
 import datetime
 from getpass import getuser
 from typeguard import typechecked
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import cast, Any, Callable, Dict, Iterable, Optional, Union, List, Sequence, Tuple
 from uuid import uuid4
 from socket import gethostname
 from concurrent.futures import Future
 from functools import partial
+
+# mostly for type checking
+from parsl.channels.base import Channel
+from parsl.executors.base import ParslExecutor, FutureWithTaskID
+from parsl.providers.provider_base import Channeled, MultiChanneled, ExecutionProvider
 
 import parsl
 from parsl.app.errors import RemoteExceptionWrapper
@@ -33,7 +38,6 @@ from parsl.dataflow.rundirs import make_rundir
 from parsl.dataflow.states import States, FINAL_STATES, FINAL_FAILURE_STATES
 from parsl.dataflow.taskrecord import TaskRecord
 from parsl.dataflow.usage_tracking.usage import UsageTracker
-from parsl.executors.base import ParslExecutor
 from parsl.executors.status_handling import BlockProviderExecutor
 from parsl.executors.threads import ThreadPoolExecutor
 from parsl.monitoring import MonitoringHub
@@ -206,14 +210,29 @@ class DataFlowKernel(object):
             task_log_info = self._create_task_log_info(task_record)
             self.monitoring.send(MessageType.TASK_INFO, task_log_info)
 
-    def _create_task_log_info(self, task_record):
+    def _create_task_log_info(self, task_record: TaskRecord) -> Dict[str, Any]:
         """
         Create the dictionary that will be included in the log.
         """
-        info_to_monitor = ['func_name', 'memoize', 'hashsum', 'fail_count', 'fail_cost', 'status',
-                           'id', 'time_invoked', 'try_time_launched', 'time_returned', 'try_time_returned', 'executor']
 
-        task_log_info = {"task_" + k: task_record[k] for k in info_to_monitor}
+        # because self.tasks[task_id] is now a TaskRecord not a Dict[str,...], type checking
+        # can't do enough type checking if just iterating over this list of keys to copy
+        # and the assignments need to be written out explicitly.
+
+        task_log_info = {}  # type: Dict[str, Any]
+
+        task_log_info["task_func_name"] = task_record['func_name']
+        task_log_info["task_memoize"] = task_record['memoize']
+        task_log_info["task_hashsum"] = task_record['hashsum']
+        task_log_info["task_fail_count"] = task_record['fail_count']
+        task_log_info["task_fail_cost"] = task_record['fail_cost']
+        task_log_info["task_status"] = task_record['status']
+        task_log_info["task_id"] = task_record['id']
+        task_log_info["task_time_invoked"] = task_record['time_invoked']
+        task_log_info["task_try_time_launched"] = task_record['try_time_launched']
+        task_log_info["task_time_returned"] = task_record['time_returned']
+        task_log_info["task_try_time_returned"] = task_record['try_time_returned']
+        task_log_info["task_executor"] = task_record['executor']
         task_log_info['run_id'] = self.run_id
         task_log_info['try_id'] = task_record['try_id']
         task_log_info['timestamp'] = datetime.datetime.now()
@@ -241,9 +260,7 @@ class DataFlowKernel(object):
         task_log_info['task_stderr'] = stderr_name
         task_log_info['task_fail_history'] = ",".join(task_record['fail_history'])
         task_log_info['task_depends'] = None
-        if task_record['depends'] is not None:
-            task_log_info['task_depends'] = ",".join([str(t.tid) for t in task_record['depends']
-                                                      if isinstance(t, AppFuture) or isinstance(t, DataFuture)])
+        task_log_info['task_depends'] = ",".join([str(t.tid) for t in task_record['depends'] if isinstance(t, AppFuture) or isinstance(t, DataFuture)])
 
         j = task_record['joins']
         if isinstance(j, AppFuture) or isinstance(j, DataFuture):
@@ -257,9 +274,8 @@ class DataFlowKernel(object):
         """
         count = 0
         for dep in depends:
-            if isinstance(dep, Future):
-                if not dep.done():
-                    count += 1
+            if not dep.done():
+                count += 1
 
         return count
 
@@ -480,7 +496,7 @@ class DataFlowKernel(object):
         """
 
         with self.task_state_counts_lock:
-            if 'status' in task_record:
+            if hasattr(task_record, 'status'):
                 self.task_state_counts[task_record['status']] -= 1
             self.task_state_counts[new_state] += 1
             task_record['status'] = new_state
@@ -641,7 +657,7 @@ class DataFlowKernel(object):
 
         self._send_task_log_info(task_record)
 
-        if hasattr(exec_fu, "parsl_executor_task_id"):
+        if isinstance(exec_fu, FutureWithTaskID):
             logger.info(f"Parsl task {task_id} try {try_id} launched on executor {executor.label} with executor id {exec_fu.parsl_executor_task_id}")
         else:
             logger.info(f"Parsl task {task_id} try {try_id} launched on executor {executor.label}")
@@ -659,6 +675,9 @@ class DataFlowKernel(object):
             - executor (str) : executor where the app is going to be launched
             - args (List) : Positional args to app function
             - kwargs (Dict) : Kwargs to app function
+            - func : the function that will be invoked
+
+        Returns:   args, kwargs, (replacement, wrapping) function
         """
 
         # Return if the task is a data management task, rather than doing
@@ -745,7 +764,9 @@ class DataFlowKernel(object):
 
         return depends
 
-    def _unwrap_futures(self, args, kwargs):
+    def _unwrap_futures(self,
+                        args: Sequence[Any],
+                        kwargs: Dict[str, Any]) -> Tuple[Sequence[Any], Dict[str, Any], Sequence[Tuple[Exception, str]]]:
         """This function should be called when all dependencies have completed.
 
         It will rewrite the arguments for that task, replacing each Future
@@ -763,6 +784,10 @@ class DataFlowKernel(object):
             a rewritten kwargs dict
             pairs of exceptions, task ids from any Futures which stored
             exceptions rather than results.
+
+        TODO: mypy note: we take a *tuple* of args but return a *list* of args.
+        That's an (unintentional?) change of type of arg structure which leads me
+        to try to represent the args in TaskRecord as a Sequence
         """
         dep_failures = []
 
@@ -774,7 +799,9 @@ class DataFlowKernel(object):
                     new_args.extend([dep.result()])
                 except Exception as e:
                     if hasattr(dep, 'task_def'):
-                        tid = dep.task_def['id']
+                        # this cast is because hasattr facts don't propagate into if statements - replace with a protocol?
+                        d_tmp = cast(Any, dep)
+                        tid = d_tmp.task_def['id']
                     else:
                         tid = None
                     dep_failures.extend([(e, tid)])
@@ -789,7 +816,8 @@ class DataFlowKernel(object):
                     kwargs[key] = dep.result()
                 except Exception as e:
                     if hasattr(dep, 'task_def'):
-                        tid = dep.task_def['id']
+                        d_tmp = cast(Any, dep)
+                        tid = d_tmp.task_def['id']
                     else:
                         tid = None
                     dep_failures.extend([(e, tid)])
@@ -803,7 +831,8 @@ class DataFlowKernel(object):
                         new_inputs.extend([dep.result()])
                     except Exception as e:
                         if hasattr(dep, 'task_def'):
-                            tid = dep.task_def['id']
+                            d_tmp = cast(Any, dep)
+                            tid = d_tmp.task_def['id']
                         else:
                             tid = None
                         dep_failures.extend([(e, tid)])
@@ -814,7 +843,18 @@ class DataFlowKernel(object):
 
         return new_args, kwargs, dep_failures
 
-    def submit(self, func, app_args, executors='all', cache=False, ignore_for_cache=None, app_kwargs={}, join=False):
+    def submit(self,
+               func: Callable,
+               app_args: Sequence[Any],
+               executors: Union[str, Sequence[str]] = 'all',
+               cache: bool = False,
+               # turning ignore_for_cache into a Sequence gives a type error, because this
+               # argument is mutated later on. This makes me worried that there's a subtle
+               # bug here with mutation happening of a supplied parameter that might not
+               # be expected to be mutated.
+               ignore_for_cache: Optional[List[str]] = None,
+               app_kwargs: Dict[str, Any] = {},
+               join: bool = False) -> AppFuture:
         """Add task to the dataflow system.
 
         If the app task has the executors attributes not set (default=='all')
@@ -877,7 +917,7 @@ class DataFlowKernel(object):
         resource_specification = app_kwargs.get('parsl_resource_specification', {})
 
         task_def: TaskRecord
-        task_def = {'depends': None,
+        task_def = {'depends': [],
                     'executor': executor,
                     'func_name': func.__name__,
                     'memoize': cache,
@@ -897,6 +937,8 @@ class DataFlowKernel(object):
                     'try_time_launched': None,
                     'try_time_returned': None,
                     'resource_specification': resource_specification}
+
+        self.update_task_state(task_def, States.unsched)
 
         self.update_task_state(task_def, States.unsched)
 
@@ -987,7 +1029,7 @@ class DataFlowKernel(object):
 
         logger.info("End of summary")
 
-    def _create_remote_dirs_over_channel(self, provider, channel):
+    def _create_remote_dirs_over_channel(self, provider: ExecutionProvider, channel: Channel) -> None:
         """ Create script directories across a channel
 
         Parameters
@@ -1010,23 +1052,27 @@ class DataFlowKernel(object):
 
         channel.makedirs(channel.script_dir, exist_ok=True)
 
-    def add_executors(self, executors):
+    def add_executors(self, executors: Sequence[ParslExecutor]) -> None:
         for executor in executors:
             executor.run_id = self.run_id
             executor.run_dir = self.run_dir
             executor.hub_address = self.hub_address
             executor.hub_port = self.hub_interchange_port
-            if hasattr(executor, 'provider'):
+            if executor.provider is not None:  # could be a protocol?
                 if hasattr(executor.provider, 'script_dir'):
                     executor.provider.script_dir = os.path.join(self.run_dir, 'submit_scripts')
                     os.makedirs(executor.provider.script_dir, exist_ok=True)
 
-                    if hasattr(executor.provider, 'channels'):
+                    if isinstance(executor.provider, MultiChanneled):
                         logger.debug("Creating script_dir across multiple channels")
                         for channel in executor.provider.channels:
                             self._create_remote_dirs_over_channel(executor.provider, channel)
-                    else:
+                    elif isinstance(executor.provider, Channeled):
                         self._create_remote_dirs_over_channel(executor.provider, executor.provider.channel)
+                    else:
+                        raise ValueError(("Assuming executor.provider has channel(s) based on it "
+                                          "having provider/script_dir, but actually it isn't a "
+                                          "(Multi)Channeled instance. provider = {}").format(executor.provider))
 
             self.executors[executor.label] = executor
             block_ids = executor.start()
@@ -1109,6 +1155,18 @@ class DataFlowKernel(object):
             if not executor.bad_state_is_set:
                 if isinstance(executor, BlockProviderExecutor):
                     logger.info(f"Scaling in executor {executor.label}")
+
+                    # this block catches the complicated type situation
+                    # that an executor is managed but has no provider.
+                    # ideally the various ways of indicating that an
+                    # executor does provider scaling would be rationalised
+                    # to make this neater.
+                    if executor.provider is None:
+                        logger.error("There is no provider to perform scaling in")
+                        continue
+
+                    # what's the proof that there's a provider here?
+                    # some claim that "managed" implies that there is a provider?
                     job_ids = executor.provider.resources.keys()
                     block_ids = executor.scale_in(len(job_ids))
                     if self.monitoring and block_ids:
@@ -1151,7 +1209,7 @@ class DataFlowKernel(object):
 
         Kwargs:
             - tasks (List of task records) : List of task ids to checkpoint. Default=None
-                                         if set to None, we iterate over all tasks held by the DFK.
+                                         if set to None or [], we iterate over all tasks held by the DFK.
 
         .. note::
             Checkpointing only works if memoization is enabled
@@ -1163,7 +1221,7 @@ class DataFlowKernel(object):
         """
         with self.checkpoint_lock:
             if tasks:
-                checkpoint_queue = tasks
+                checkpoint_queue = tasks  # type: Iterable[TaskRecord]
             else:
                 checkpoint_queue = self.checkpointable_tasks
                 self.checkpointable_tasks = []
@@ -1198,7 +1256,7 @@ class DataFlowKernel(object):
                             continue
                         t = {'hash': hashsum,
                              'exception': None,
-                             'result': None}
+                             'result': None}  # type: Dict[str, Any]
 
                         t['result'] = app_fu.result()
 
@@ -1270,7 +1328,12 @@ class DataFlowKernel(object):
                                                                                   len(memo_lookup_table.keys())))
         return memo_lookup_table
 
-    def load_checkpoints(self, checkpointDirs):
+    @typeguard.typechecked
+    def load_checkpoints(self, checkpointDirs: Optional[Sequence[str]]) -> 'Dict[str, Future]':
+        # typeguard 2.10.1 cannot cope with Future[Any], giving a type-not-subscriptable error.
+        # Future with no subscript is probably equivalent though? I wanted the Any in there as
+        # an explicit note that I had the possibility of tighter typing but wasn't using it.
+        # def load_checkpoints(self, checkpointDirs: Optional[List[str]]) -> 'Dict[str, Future[Any]]':
         """Load checkpoints from the checkpoint files into a dictionary.
 
         The results are used to pre-populate the memoizer's lookup_table
@@ -1284,13 +1347,10 @@ class DataFlowKernel(object):
         """
         self.memo_lookup_table = None
 
-        if not checkpointDirs:
+        if checkpointDirs:
+            return self._load_checkpoints(checkpointDirs)
+        else:
             return {}
-
-        if type(checkpointDirs) is not list:
-            raise BadCheckpoint("checkpointDirs expects a list of checkpoints")
-
-        return self._load_checkpoints(checkpointDirs)
 
     @staticmethod
     def _log_std_streams(task_record: TaskRecord) -> None:
@@ -1328,12 +1388,17 @@ class DataFlowKernelLoader(object):
         if cls._dfk is not None:
             raise RuntimeError('Config has already been loaded')
 
+        #  using new_dfk as an intermediate variable allows it to have
+        #  the type DataFlowKernel, which is stricter than the type of
+        #  cls._dfk : Optional[DataFlowKernel] and so we can return the
+        #  correct type.
         if config is None:
-            cls._dfk = DataFlowKernel(Config())
+            new_dfk = DataFlowKernel(Config())
         else:
-            cls._dfk = DataFlowKernel(config)
+            new_dfk = DataFlowKernel(config)
 
-        return cls._dfk
+        cls._dfk = new_dfk
+        return new_dfk
 
     @classmethod
     def wait_for_current_tasks(cls) -> None:

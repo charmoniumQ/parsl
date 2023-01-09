@@ -1,11 +1,15 @@
+from __future__ import annotations
 import logging
 import threading
 import time
 
-from typing import Sequence
-
 from parsl.executors.base import ParslExecutor
 from parsl.dataflow.job_status_poller import JobStatusPoller
+
+from typing import Any, Callable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from parsl.dataflow.dflow import DataFlowKernel
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +48,7 @@ class FlowControl(object):
     from a duplicate logger being added by the thread.
     """
 
-    def __init__(self, dfk, *args, threshold=20, interval=5):
+    def __init__(self, dfk: "DataFlowKernel", *args: Tuple[Any, ...], threshold: int = 20, interval: int = 5) -> None:
         """Initialize the flowcontrol object.
 
         We start the timer thread here
@@ -63,7 +67,7 @@ class FlowControl(object):
         self.callback = self.task_status_poller.poll
         self._handle = None
         self._event_count = 0
-        self._event_buffer = []
+        self._event_buffer = []  # type: List[str]
         self._wake_up_time = time.time() + 1
         self._kill_event = threading.Event()
         self._thread = threading.Thread(target=self._wake_up_timer, args=(self._kill_event,), name="FlowControl-Thread")
@@ -129,7 +133,8 @@ class Timer(object):
 
     """
 
-    def __init__(self, callback, *args, interval=5, name=None):
+    # TODO: some kind of dependentish type here? eg Callable[X] and args has type X?
+    def __init__(self, callback: Callable, *args: Tuple[Any, ...], interval: float = 5, name: Optional[str] = None) -> None:
         """Initialize the flowcontrol object
         We start the timer thread here
 
